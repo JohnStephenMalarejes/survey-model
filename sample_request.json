@@ -1,0 +1,11 @@
+{
+  "topic": "The impact of AI tools on programming productivity among university students",
+  "survey_category": "Academic Research",
+  "research_type": "Quantitative",
+  "target_respondents": "University students who have used AI coding tools",
+  "objectives": ["Identify AI coding tools students use", "Measure frequency of use", "Explore perceived effects on productivity"],
+  "number_of_questions": 15,
+  "question_types": ["multiple_choice", "likert_scale", "short_answer"],
+  "language": "English",
+  "additional_instructions": "Use simple, neutral wording."
+}
