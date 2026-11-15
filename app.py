@@ -1,6 +1,7 @@
-
 import os
 import re
+import copy
+import hmac
 import json
 import logging
 import threading
@@ -37,27 +38,46 @@ logger = logging.getLogger(__name__)
 # 2. ENVIRONMENT VARIABLES
 # ============================================================
 
-MODEL_GGUF_PATH = os.getenv(
-    "MODEL_GGUF_PATH",
-    "./model/ai_survey_qwen_3b_q4.gguf"
+def resolve_path(value):
+    path = Path(value)
+    if not path.is_absolute():
+        path = PROJECT_DIR / path
+    return path.resolve()
+
+
+MODEL_GGUF_PATH = resolve_path(
+    os.getenv("MODEL_GGUF_PATH", "./model/ai_survey_qwen_3b_q4.gguf")
 )
 
-MODEL_GGUF_PATH = Path(MODEL_GGUF_PATH)
+# Optional: a separate model for research insights (for example the
+# plain Qwen2.5-3B-Instruct Q4 GGUF). If not set, the survey model is
+# reused and loaded only once.
+INSIGHT_MODEL_GGUF_PATH = resolve_path(
+    os.getenv("INSIGHT_MODEL_GGUF_PATH", str(MODEL_GGUF_PATH))
+)
 
-if not MODEL_GGUF_PATH.is_absolute():
-    MODEL_GGUF_PATH = PROJECT_DIR / MODEL_GGUF_PATH
-
-N_CTX = int(os.getenv("N_CTX", "1024"))
+# Insights need more context than survey generation because the
+# statistics (including follow-up answers) are part of the prompt. If the
+# detailed overall insight returns truncated JSON, raise this further in
+# your .env. NOTE: a value set in .env overrides this default.
+N_CTX = int(os.getenv("N_CTX", "6144"))
 N_THREADS = int(os.getenv("N_THREADS", "4"))
 N_BATCH = int(os.getenv("N_BATCH", "64"))
 
-DEFAULT_MAX_NEW_TOKENS = int(
-    os.getenv("DEFAULT_MAX_NEW_TOKENS", "700")
-)
+# Safety room kept free in the context window, and the smallest reply
+# (in tokens) worth generating for a research insight.
+CONTEXT_MARGIN = 64
+MIN_REPLY_TOKENS = 300
 
-MAX_ALLOWED_NEW_TOKENS = int(
-    os.getenv("MAX_ALLOWED_NEW_TOKENS", "900")
-)
+DEFAULT_MAX_NEW_TOKENS = int(os.getenv("DEFAULT_MAX_NEW_TOKENS", "700"))
+MAX_ALLOWED_NEW_TOKENS = int(os.getenv("MAX_ALLOWED_NEW_TOKENS", "900"))
+
+# Single-question insights stay short.
+INSIGHT_MAX_NEW_TOKENS = int(os.getenv("INSIGHT_MAX_NEW_TOKENS", "700"))
+# The overall survey insight is longer and more detailed.
+INSIGHT_SURVEY_MAX_NEW_TOKENS = int(os.getenv("INSIGHT_SURVEY_MAX_NEW_TOKENS", "1500"))
+# Follow-up answers share this budget with the main question statistics.
+INSIGHT_MAX_STATS_CHARS = int(os.getenv("INSIGHT_MAX_STATS_CHARS", "7000"))
 
 API_KEY = os.getenv("API_KEY", "").strip()
 
@@ -73,7 +93,7 @@ allowed_origins = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:3000"
+        "http://localhost:3000,http://localhost:5173"
     ).split(",")
     if origin.strip()
 ]
@@ -113,8 +133,6 @@ def authenticate_request():
 
     supplied_key = request.headers.get("X-API-Key", "")
 
-    import hmac
-
     if not hmac.compare_digest(supplied_key, API_KEY):
         return jsonify({
             "success": False,
@@ -125,7 +143,7 @@ def authenticate_request():
 
 
 # ============================================================
-# 5. SURVEY GENERATION SYSTEM PROMPT
+# 5. SYSTEM PROMPTS
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -189,13 +207,105 @@ Return only the JSON object.
 """
 
 
+INSIGHT_RULES = """
+RULES:
+
+1. Use only the numbers and answer labels provided. Never invent
+   figures, answers, respondents, or quotes.
+2. Responses describe what participants selected. They do not prove
+   why. Present explanations as hypotheses, using words such as
+   "may", "could", or "one possible explanation".
+3. Do not claim statistical significance, representativeness, or
+   causation.
+4. Mention low response counts or low answer rates when relevant.
+5. Each question has an answerKind. For "choice" and "open_text"
+   questions, topAnswers lists the actual answers with counts. Only
+   name an answer or theme that appears in topAnswers, and quote
+   answers as written. For open_text questions, say so when most
+   answers are non-answers such as "I don't know" or "none", and do
+   not invent themes. If topAnswers is empty, you have no information
+   about what respondents said: report only how many answered.
+6. Every sentence must be backed by the statistics. Do not pad with
+   generic advice that ignores the data.
+7. Return valid JSON only, with no Markdown and no text outside
+   the JSON.
+8. The statistics may include a "followUps" list. Each item is an
+   extra question that was asked ONLY to respondents whose answer to
+   an earlier question triggered it. parentQuestion is the question it
+   follows, triggeredByAnswer shows which answers triggered it (for
+   example {"No": 4}), and answersCount counts only those
+   respondents, never the whole sample. topAnswers lists their written
+   answers with counts. Use follow-ups to explain or qualify the
+   parentQuestion, quote only answers that appear in topAnswers, and
+   never present follow-up counts as results for all respondents. If
+   there is no "followUps" list, do not mention follow-ups.
+"""
+
+
+INSIGHT_QUESTION_PROMPT = """
+You are a careful survey research analyst.
+
+You receive pre-computed statistics for ONE survey question. Write a
+short research insight based ONLY on those statistics.
+""" + INSIGHT_RULES + """
+9. Keep each field to 2-5 sentences, in plain language.
+
+REQUIRED JSON STRUCTURE:
+
+{
+    "summary": "Executive summary of the main observed patterns.",
+    "discussion": "Possible explanations, stated as hypotheses.",
+    "recommendation": "Concrete next research steps.",
+    "limitations": "Limits of this data and analysis."
+}
+"""
+
+
+INSIGHT_SURVEY_PROMPT = """
+You are a careful survey research analyst writing the overall report
+for a whole survey.
+
+You receive pre-computed statistics for every question. Write a
+detailed, well-organized research insight based ONLY on those
+statistics.
+""" + INSIGHT_RULES + """
+9. Be thorough. Cover every question that has answers, not just the
+   most striking ones. Compare questions where the data allows it,
+   and point out contradictions (for example, a question answered
+   positively but follow-up answers that suggest uncertainty).
+10. If followUps are provided, cover every follow-up that has answers.
+   Tie each one back to its parentQuestion and say which answer
+   triggered it. Write at least one finding about follow-up answers,
+   and use them in the discussion to explain the main results.
+11. Length per field: summary 5-8 sentences; findings 5-12 items;
+   discussion 6-9 sentences; recommendation 5-8 sentences;
+   limitations 4-6 sentences.
+
+REQUIRED JSON STRUCTURE:
+
+{
+    "summary": "Overview: response count, answer completeness, and the main patterns across the survey.",
+    "findings": [
+        "One finding per question or theme, citing counts and percentages.",
+        "Another finding."
+    ],
+    "discussion": "Possible explanations and connections between questions, stated as hypotheses.",
+    "recommendation": "Concrete, prioritized next research steps tied to the findings.",
+    "limitations": "Limits of this data and analysis, including sample size."
+}
+"""
+
+
 # ============================================================
 # 6. MODEL SERVICE
 # ============================================================
 
 class ModelService:
 
-    def __init__(self):
+    def __init__(self, model_path, label):
+        self.model_path = model_path
+        self.label = label
+
         self.model = None
         self.loaded = False
 
@@ -206,10 +316,7 @@ class ModelService:
 
     def load(self):
         """
-        Load the quantized Qwen2.5-3B GGUF model.
-
-        The model file must already contain the merged LoRA
-        adapter and must be converted to Q4_K_M GGUF.
+        Load a quantized GGUF model.
         """
 
         if self.loaded:
@@ -220,18 +327,18 @@ class ModelService:
             if self.loaded:
                 return
 
-            logger.info("Loading AI Survey Generator model...")
-            logger.info("Model path: %s", MODEL_GGUF_PATH)
+            logger.info("Loading %s model...", self.label)
+            logger.info("Model path: %s", self.model_path)
 
-            if not MODEL_GGUF_PATH.is_file():
+            if not self.model_path.is_file():
                 raise FileNotFoundError(
-                    f"GGUF model not found: {MODEL_GGUF_PATH}. "
+                    f"GGUF model not found: {self.model_path}. "
                     "Place your quantized model in the model folder "
-                    "or update MODEL_GGUF_PATH in your .env file."
+                    "or update the path in your .env file."
                 )
 
             self.model = Llama(
-                model_path=str(MODEL_GGUF_PATH),
+                model_path=str(self.model_path),
 
                 n_ctx=N_CTX,
                 n_threads=N_THREADS,
@@ -247,12 +354,32 @@ class ModelService:
 
             self.loaded = True
 
-            logger.info("Qwen2.5-3B GGUF model loaded successfully.")
-            logger.info("Inference device: CPU")
+            logger.info("%s model loaded successfully.", self.label)
 
-    def generate(self, messages, max_new_tokens):
+    def count_tokens(self, messages):
         """
-        Generate a response using Qwen2.5-3B.
+        Approximate number of prompt tokens for a chat (Qwen/ChatML
+        layout). Used to make sure prompt + reply fit in N_CTX.
+        """
+
+        self.load()
+
+        text = "".join(
+            f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+            for m in messages
+        ) + "<|im_start|>assistant\n"
+
+        return len(
+            self.model.tokenize(
+                text.encode("utf-8"),
+                add_bos=False,
+                special=True
+            )
+        )
+
+    def generate(self, messages, max_new_tokens, temperature=0.3, seed=None):
+        """
+        Generate a chat response.
         """
 
         self.load()
@@ -264,10 +391,10 @@ class ModelService:
 
                 max_tokens=max_new_tokens,
 
-                temperature=0.3,
+                temperature=temperature,
                 top_p=0.9,
                 repeat_penalty=1.08,
-
+                seed=seed,
                 stop=[
                     "<|im_end|>",
                     "<|endoftext|>"
@@ -282,12 +409,19 @@ class ModelService:
         return content.strip()
 
 
-# Create one shared model service for the application.
-service = ModelService()
+# Survey generation model.
+service = ModelService(MODEL_GGUF_PATH, "AI Survey Generator")
+
+# Insight model. Reuses the same loaded model when the paths match,
+# so the memory cost is not doubled.
+if INSIGHT_MODEL_GGUF_PATH == MODEL_GGUF_PATH:
+    insight_service = service
+else:
+    insight_service = ModelService(INSIGHT_MODEL_GGUF_PATH, "Research Insight")
 
 
 # ============================================================
-# 7. INPUT VALIDATION
+# 7. INPUT VALIDATION (SURVEY GENERATION)
 # ============================================================
 
 SUPPORTED_QUESTION_TYPES = {
@@ -455,7 +589,7 @@ def validate_survey_input(data):
 
 
 # ============================================================
-# 8. PROMPT BUILDER
+# 8. PROMPT BUILDERS
 # ============================================================
 
 def make_prompt(survey_data):
@@ -665,7 +799,125 @@ def normalize_generated_survey(survey, survey_data):
 
 
 # ============================================================
-# 11. HEALTH CHECK ENDPOINT
+# 11. RESEARCH INSIGHT HELPERS
+# ============================================================
+
+INSIGHT_FIELDS = ("summary", "discussion", "recommendation", "limitations")
+
+
+def as_text(value):
+    """
+    Convert a model field to plain text. Small models sometimes
+    return a list of sentences instead of a string.
+    """
+
+    if value is None:
+        return ""
+
+    if isinstance(value, (list, tuple)):
+        return " ".join(
+            str(item).strip() for item in value if str(item).strip()
+        )
+
+    return str(value).strip()
+
+
+def compact_stats(stats, limit):
+    """
+    Serialize statistics as compact JSON that fits the prompt budget.
+
+    First shortens each topAnswers list (questions and follow-ups),
+    then drops trailing follow-ups, then trailing questions, if it is
+    still too long. Returns the JSON text, the number of questions
+    omitted and the number of follow-ups omitted.
+    """
+
+    data = copy.deepcopy(stats)
+
+    def dump():
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    questions = data.get("questions")
+
+    # Keep a reference to the list stored in data so popping from it
+    # shrinks the serialized output. Anything that is not a list is
+    # ignored and removed.
+    follow_ups = data.get("followUps")
+
+    if not isinstance(follow_ups, list):
+        follow_ups = []
+        data.pop("followUps", None)
+
+    if not isinstance(questions, list):
+        text = dump()
+        if len(text) > limit:
+            raise ValueError("Statistics are too large to analyze.")
+        return text, 0, 0
+
+    for cap in (6, 4, 3, 2, 0):
+        for item in [*questions, *follow_ups]:
+            if isinstance(item, dict) and isinstance(
+                item.get("topAnswers"), list
+            ):
+                item["topAnswers"] = item["topAnswers"][:cap]
+
+        if len(dump()) <= limit:
+            return dump(), 0, 0
+
+    # Follow-ups are supplementary to the main questions, so they are
+    # dropped first.
+    omitted_follow_ups = 0
+
+    while follow_ups and len(dump()) > limit:
+        follow_ups.pop()
+        omitted_follow_ups += 1
+
+    omitted = 0
+
+    while questions and len(dump()) > limit:
+        questions.pop()
+        omitted += 1
+
+    if not questions:
+        raise ValueError("Statistics are too large to analyze.")
+
+    if omitted:
+        data["omittedQuestions"] = omitted
+
+    if omitted_follow_ups:
+        data["omittedFollowUps"] = omitted_follow_ups
+
+    return dump(), omitted, omitted_follow_ups
+
+
+def validate_insight_input(data):
+    """
+    Validate the statistics payload sent by the frontend.
+    """
+
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object.")
+
+    scope = data.get("scope", "survey")
+
+    if scope not in ("survey", "question"):
+        raise ValueError("scope must be 'survey' or 'question'.")
+
+    stats = data.get("stats")
+
+    if not isinstance(stats, dict) or not stats:
+        raise ValueError("stats is required and must be a JSON object.")
+
+    response_count = stats.get("validResponseCount", stats.get("responseCount"))
+
+    if isinstance(response_count, (int, float)) and response_count <= 0:
+        raise ValueError("There are no responses to analyze.")
+
+    return scope, stats
+
+
+# ============================================================
+# 12. HEALTH CHECK ENDPOINT
 # ============================================================
 
 @app.route("/health", methods=["GET"])
@@ -679,13 +931,16 @@ def health():
         "adapter": "Merged trained LoRA",
         "quantization": "Q4_K_M",
         "device": service.device,
+        "context_length": N_CTX,
         "model_loaded": service.loaded,
-        "model_exists": MODEL_GGUF_PATH.is_file()
+        "model_exists": MODEL_GGUF_PATH.is_file(),
+        "insight_model_exists": INSIGHT_MODEL_GGUF_PATH.is_file(),
+        "insight_model_shared": insight_service is service
     }), 200
 
 
 # ============================================================
-# 12. API INFORMATION ENDPOINT
+# 13. API INFORMATION ENDPOINT
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -696,7 +951,9 @@ def home():
         "message": "AI Survey Generator API is running.",
         "endpoints": {
             "health": "/health",
-            "generate": "/api/generate"
+            "generate": "/api/generate",
+            "insight": "/api/insight",
+            "followups": "/api/followups"
         },
         "method": "POST",
         "authentication": (
@@ -708,17 +965,13 @@ def home():
 
 
 # ============================================================
-# 13. GENERATE SURVEY ENDPOINT
+# 14. GENERATE SURVEY ENDPOINT
 # ============================================================
 
 @app.route("/api/generate", methods=["POST"])
 def generate_survey():
 
     try:
-
-        # ----------------------------------------
-        # Read request
-        # ----------------------------------------
 
         data = request.get_json(silent=True)
 
@@ -728,15 +981,7 @@ def generate_survey():
                 "error": "A valid JSON request body is required."
             }), 400
 
-        # ----------------------------------------
-        # Validate requirements
-        # ----------------------------------------
-
         survey_data = validate_survey_input(data)
-
-        # ----------------------------------------
-        # Build model prompt
-        # ----------------------------------------
 
         user_prompt = make_prompt(survey_data)
 
@@ -750,10 +995,6 @@ def generate_survey():
                 "content": user_prompt
             }
         ]
-
-        # ----------------------------------------
-        # Determine generation length
-        # ----------------------------------------
 
         requested_tokens = data.get(
             "max_new_tokens",
@@ -773,10 +1014,6 @@ def generate_survey():
             min(requested_tokens, MAX_ALLOWED_NEW_TOKENS)
         )
 
-        # ----------------------------------------
-        # Generate response
-        # ----------------------------------------
-
         logger.info(
             "Generating survey: topic=%s, questions=%s",
             survey_data["topic"],
@@ -788,15 +1025,7 @@ def generate_survey():
             max_new_tokens
         )
 
-        # ----------------------------------------
-        # Parse JSON
-        # ----------------------------------------
-
         parsed_survey = parse_model_json(raw_response)
-
-        # ----------------------------------------
-        # Validate generated survey
-        # ----------------------------------------
 
         final_survey = normalize_generated_survey(
             parsed_survey,
@@ -841,7 +1070,380 @@ def generate_survey():
 
 
 # ============================================================
-# 14. ERROR HANDLERS
+# 15. RESEARCH INSIGHT ENDPOINT
+# ============================================================
+
+@app.route("/api/insight", methods=["POST"])
+def generate_insight():
+    """
+    Turn pre-computed survey statistics into a written research
+    insight. The model only narrates the numbers it is given.
+
+    scope="survey"   -> long, detailed overall report (with findings)
+    scope="question" -> short insight for one question
+    """
+
+    try:
+
+        data = request.get_json(silent=True)
+
+        scope, stats = validate_insight_input(data)
+
+        system_prompt = (
+            INSIGHT_SURVEY_PROMPT if scope == "survey" else INSIGHT_QUESTION_PROMPT
+        )
+        requested_tokens = (
+            INSIGHT_SURVEY_MAX_NEW_TOKENS
+            if scope == "survey"
+            else INSIGHT_MAX_NEW_TOKENS
+        )
+
+        # Shrink the statistics until prompt + reply fit in the model's
+        # context window (N_CTX), instead of failing with "Requested
+        # tokens exceed context window".
+        stats_limit = INSIGHT_MAX_STATS_CHARS
+        min_stats_limit = 1200
+
+        while True:
+            stats_json, omitted, omitted_follow_ups = compact_stats(
+                stats, stats_limit
+            )
+
+            user_prompt = (
+                f"Scope: {scope}\n"
+                "Statistics (JSON):\n"
+                f"{stats_json}\n\n"
+                "Write the research insight now. Return JSON only."
+            )
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ]
+
+            prompt_tokens = insight_service.count_tokens(messages)
+            room = N_CTX - prompt_tokens - CONTEXT_MARGIN
+
+            if room >= requested_tokens or stats_limit <= min_stats_limit:
+                break
+
+            stats_limit = max(min_stats_limit, int(stats_limit * 0.75))
+
+        if room < MIN_REPLY_TOKENS:
+            raise ValueError(
+                f"The statistics are too large for the model's context "
+                f"window ({N_CTX} tokens). Set N_CTX=6144 in your .env "
+                "file and restart the AI service."
+            )
+
+        max_tokens = min(requested_tokens, room)
+        reply_clamped = max_tokens < requested_tokens
+
+        if reply_clamped:
+            logger.warning(
+                "Reply limited to %s tokens (wanted %s) because N_CTX=%s "
+                "is small. Raise N_CTX in .env for fuller insights.",
+                max_tokens,
+                requested_tokens,
+                N_CTX
+            )
+
+        logger.info(
+            "Generating insight: scope=%s, stats_chars=%s, omitted=%s, "
+            "omitted_followups=%s, max_tokens=%s",
+            scope,
+            len(stats_json),
+            omitted,
+            omitted_follow_ups,
+            max_tokens
+        )
+
+        raw_response = insight_service.generate(
+            messages,
+            max_tokens,
+            temperature=0.2
+        )
+
+        try:
+            parsed = parse_model_json(raw_response)
+        except ValueError:
+            if reply_clamped:
+                raise ValueError(
+                    "The AI reply was cut off because the model's context "
+                    f"window is too small (N_CTX={N_CTX}). Set N_CTX=6144 "
+                    "in your .env file and restart the AI service."
+                )
+            raise
+
+        insight = {
+            field: as_text(parsed.get(field))
+            for field in INSIGHT_FIELDS
+        }
+
+        findings = parsed.get("findings")
+
+        if isinstance(findings, str):
+            findings = [findings]
+
+        insight["findings"] = (
+            [str(f).strip() for f in findings if str(f).strip()]
+            if isinstance(findings, list)
+            else []
+        )
+
+        if not insight["summary"]:
+            raise ValueError("The model did not return a summary.")
+
+        if not insight["limitations"]:
+            insight["limitations"] = (
+                "This insight describes submitted responses only and "
+                "does not establish causes or representativeness."
+            )
+
+        logger.info("Insight generated successfully.")
+
+        return jsonify({
+            "success": True,
+            "insight": insight,
+            "model": "Qwen2.5-3B-Instruct (local, Q4_K_M)",
+            "omittedQuestions": omitted,
+            "omittedFollowUps": omitted_follow_ups
+        }), 200
+
+    except ValueError as exc:
+
+        logger.warning("Insight error: %s", exc)
+
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 422
+
+    except FileNotFoundError as exc:
+
+        logger.error("Model file error: %s", exc)
+
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 500
+
+    except Exception as exc:
+
+        logger.exception("Insight generation failed.")
+
+        return jsonify({
+            "success": False,
+            "error": "Insight generation failed.",
+            "details": str(exc)
+        }), 500
+
+
+# ============================================================
+# 15b. CONDITIONAL FOLLOW-UP ENDPOINT
+# ============================================================
+
+FOLLOWUP_SYSTEM_PROMPT = """
+You write follow-up questions for a survey.
+
+A respondent answered an earlier question with "Yes" or "No". Write
+follow-up questions that fit THAT answer only.
+
+RULES:
+
+1. Each follow-up must relate to the ORIGINAL QUESTION and to the
+   specific answer given. Base it only on the wording of that
+   question, not on any wider topic.
+2. If the answer is "Yes": the respondent agrees or has experienced
+   it. Ask about their experience: details, how well it worked, what
+   could be improved.
+3. If the answer is "No": the respondent says it is NOT true for
+   them, or they disagree. NEVER assume the thing exists, or that
+   they used, received, or experienced it. Ask WHY not, what is
+   missing or in the way, what they would need for the answer to
+   change, or what they would want instead.
+4. Make them open-ended, neutral, and not leading.
+5. Keep each under 25 words, in simple language.
+6. Do not repeat the original question or each other.
+7. Return valid JSON only, with no Markdown:
+
+{"followups": ["Follow-up question 1?", "Follow-up question 2?"]}
+"""
+
+# Worked examples (a different topic on purpose, so the model copies
+# the pattern and not the content). One "No" and one "Yes".
+FOLLOWUP_EXAMPLES = [
+    {"role": "user", "content": (
+        "Original question: Does your neighborhood have a public library?\n"
+        "Respondent answered: No\n\n"
+        "Meaning: the respondent said this is NOT true for them. "
+        "Do not assume it exists or that they used it.\n\n"
+        "Write exactly 2 NEW follow-up question(s). Return JSON only.")},
+    {"role": "assistant", "content": json.dumps({"followups": [
+        "What makes it hard for you to access a library?",
+        "What would you want a library or similar service to offer you?"
+    ]})},
+    {"role": "user", "content": (
+        "Original question: Does your neighborhood have a public library?\n"
+        "Respondent answered: Yes\n\n"
+        "Meaning: the respondent said this is TRUE for them. "
+        "Ask about their experience with it.\n\n"
+        "Write exactly 2 NEW follow-up question(s). Return JSON only.")},
+    {"role": "assistant", "content": json.dumps({"followups": [
+        "How often do you use the library?",
+        "What could the library do to serve you better?"
+    ]})},
+]
+
+ANSWER_MEANING = {
+    "yes": "the respondent said this is TRUE for them. Ask about their experience with it.",
+    "no": "the respondent said this is NOT true for them. Do not assume it exists or that they used it.",
+}
+
+
+def extract_followups(parsed, seen, count):
+    items = parsed.get("followups")
+    if items is None and isinstance(parsed.get("questions"), list):
+        items = [q.get("question") if isinstance(q, dict) else q
+                 for q in parsed["questions"]]
+    if isinstance(items, str):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+    out = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", item).strip()
+        if not text or len(text) > 300 or text.lower() in seen:
+            continue
+        seen.add(text.lower())
+        out.append(text)
+        if len(out) == count:
+            break
+    return out
+
+
+@app.route("/api/followups", methods=["POST"])
+def generate_followups():
+    """
+    Generate follow-up questions for one Yes/No branch of a
+    conditional question.
+    """
+
+    try:
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            raise ValueError("A valid JSON request body is required.")
+
+        question = data.get("question")
+        answer = str(data.get("answer", "")).strip().lower()
+
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("question is required.")
+
+        question = question.strip()
+
+        if len(question) > 500:
+            raise ValueError("question must not exceed 500 characters.")
+
+        if answer not in ("yes", "no"):
+            raise ValueError("answer must be 'Yes' or 'No'.")
+
+        try:
+            count = int(data.get("count", 3))
+        except (ValueError, TypeError):
+            raise ValueError("count must be a number.")
+
+        count = max(1, min(count, 5))
+
+        # survey_title / survey_description may still be sent by older
+        # clients. They are deliberately NOT used: follow-ups are written
+        # from the question text alone so a broad survey topic cannot
+        # pull the model away from the question being asked.
+
+        # Previously shown follow-ups to avoid, plus an optional seed.
+        avoid = data.get("avoid", [])
+        avoid = (
+            [a.strip()[:300] for a in avoid if isinstance(a, str) and a.strip()][:6]
+            if isinstance(avoid, list) else []
+        )
+        seed = data.get("seed")
+        seed = seed if isinstance(seed, int) and 0 <= seed < 2**31 else None
+
+        avoid_block = ""
+        if avoid:
+            avoid_block = (
+                "Do NOT reuse or rephrase any of these existing follow-ups:\n"
+                + "\n".join(f"- {a}" for a in avoid) + "\n\n"
+            )
+
+        # Same layout as the worked examples in FOLLOWUP_EXAMPLES, so the
+        # model sees a consistent format.
+        user_prompt = (
+            f"Original question: {question}\n"
+            f"Respondent answered: {answer.capitalize()}\n\n"
+            f"Meaning: {ANSWER_MEANING[answer]}\n\n"
+            f"{avoid_block}"
+            f"Write exactly {count} NEW follow-up question(s). Return JSON only."
+        )
+
+        messages = [
+            {"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT},
+            *FOLLOWUP_EXAMPLES,
+            {"role": "user", "content": user_prompt}
+        ]
+
+        logger.info("Generating follow-ups: answer=%s, count=%s", answer, count)
+
+        seen = {question.lower()} | {a.lower() for a in avoid}
+        followups = []
+
+        for attempt in range(2):
+            raw_response = service.generate(
+                messages, 450,
+                temperature=0.6 + 0.1 * attempt,
+                seed=None if seed is None else seed + attempt
+            )
+            try:
+                parsed = parse_model_json(raw_response)
+            except ValueError:
+                continue
+            followups = extract_followups(parsed, seen, count)
+            if followups:
+                break
+
+        if not followups:
+            raise ValueError("The model only returned questions you already have. Try again.")
+
+        return jsonify({"success": True, "followups": followups}), 200
+
+    except ValueError as exc:
+        logger.warning("Follow-up error: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 422
+
+    except FileNotFoundError as exc:
+        logger.error("Model file error: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+    except Exception as exc:
+        logger.exception("Follow-up generation failed.")
+        return jsonify({
+            "success": False,
+            "error": "Follow-up generation failed.",
+            "details": str(exc)
+        }), 500
+
+
+# ============================================================
+# 16. ERROR HANDLERS
 # ============================================================
 
 @app.errorhandler(404)
@@ -881,23 +1483,24 @@ def internal_server_error(error):
 
 
 # ============================================================
-# 15. START APPLICATION
+# 17. START APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
 
     logger.info("=" * 60)
-    logger.info("AI SURVEY GENERATOR")
+    logger.info("AI SURVEY GENERATOR + RESEARCH INSIGHTS")
     logger.info("=" * 60)
 
     logger.info("Model: Qwen2.5-3B-Instruct")
-    logger.info("Adapter: Merged trained LoRA")
     logger.info("Quantization: Q4_K_M")
     logger.info("Device: CPU")
     logger.info("Context length: %s", N_CTX)
     logger.info("CPU threads: %s", N_THREADS)
-    logger.info("Model file: %s", MODEL_GGUF_PATH)
-    logger.info("Model file exists: %s", MODEL_GGUF_PATH.is_file())
+    logger.info("Survey model: %s", MODEL_GGUF_PATH)
+    logger.info("Insight model: %s", INSIGHT_MODEL_GGUF_PATH)
+    logger.info("Survey model exists: %s", MODEL_GGUF_PATH.is_file())
+    logger.info("Insight model exists: %s", INSIGHT_MODEL_GGUF_PATH.is_file())
 
     logger.info("Starting Flask server on %s:%s", HOST, PORT)
 

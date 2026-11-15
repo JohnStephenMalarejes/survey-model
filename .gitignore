@@ -4,3 +4,4 @@ venv/
 __pycache__/
 *.py[cod]
 model/
+llama_cpp_python-0.3.36-py3-none-win_amd64.whl
